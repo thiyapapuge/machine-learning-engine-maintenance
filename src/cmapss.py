@@ -107,3 +107,111 @@ def random_truncation(df: pd.DataFrame, seed: int = RANDOM_STATE, min_cycles: in
         lo = min(min_cycles, len(g)) - 1
         rows.append(g.iloc[rng.integers(lo, len(g))])
     return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------------------
+# Week 3 additions
+# --------------------------------------------------------------------------------------
+import time
+from pathlib import Path
+from sklearn.base import RegressorMixin, clone
+
+
+def find_project_root(start=None) -> Path:
+    """Walk up from the current folder until the folder containing src/cmapss.py is found.
+    Makes the notebooks work whatever the working directory of Jupyter / VS Code is."""
+    here = Path(start or Path.cwd()).resolve()
+    for p in [here, *here.parents]:
+        if (p / "src" / "cmapss.py").exists():
+            return p
+    raise FileNotFoundError("Project root (folder containing src/cmapss.py) not found from " + str(here))
+
+
+class WindowFeatures(BaseEstimator, TransformerMixin):
+    """Condition-normalise the sensors, then build *causal* history features per engine:
+    current value, rolling mean and rolling slope over the last ``window`` cycles, plus the cycle number.
+
+    Only the ConditionNormalizer is learned (in ``fit``). Rolling features use the past cycles of the
+    same engine only, so a row's features never depend on the future or on other engines.
+    Input X must contain engine_uid, cycle, SETTINGS and ``sensors``; rows may be in any order.
+    """
+
+    def __init__(self, sensors=None, window: int = 30, include_cycle: bool = True,
+                 random_state: int = RANDOM_STATE):
+        self.sensors = sensors
+        self.window = window
+        self.include_cycle = include_cycle
+        self.random_state = random_state
+
+    def fit(self, X, y=None):
+        self.normalizer_ = ConditionNormalizer(sensors=self.sensors, random_state=self.random_state).fit(X)
+        self.sensors_ = self.normalizer_.sensors_
+        return self
+
+    def transform(self, X):
+        z = self.normalizer_.transform(X)
+        z["engine_uid"], z["cycle"] = X["engine_uid"].to_numpy(), X["cycle"].to_numpy()
+        z = z.sort_values(["engine_uid", "cycle"])
+        g = z.groupby("engine_uid", sort=False)
+        w = self.window
+        roll = lambda s: s.rolling(w, min_periods=1)
+        out = {"cycle": z["cycle"]}
+        t = z["cycle"].astype(float)
+        mean_t = g["cycle"].transform(lambda s: roll(s.astype(float)).mean())
+        mean_t2 = g["cycle"].transform(lambda s: roll(s.astype(float) ** 2).mean())
+        var_t = mean_t2 - mean_t ** 2
+        for s in self.sensors_:
+            m = g[s].transform(lambda v: roll(v).mean())
+            mtx = (z[s] * t).groupby(z["engine_uid"], sort=False).transform(lambda v: roll(v).mean())
+            slope = (mtx - mean_t * m) / var_t.where(var_t > 1e-9)
+            out[f"{s}"] = z[s]
+            out[f"{s}_mean{w}"] = m
+            out[f"{s}_slope{w}"] = slope.fillna(0.0)
+        if not self.include_cycle:
+            out.pop("cycle")
+        F = pd.DataFrame(out).loc[X.index]          # back to the input row order
+        self.feature_names_ = list(F.columns)
+        return F
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(self.feature_names_, dtype=object)
+
+
+class SubsampledRegressor(BaseEstimator, RegressorMixin):
+    """Fit ``estimator`` on one row out of ``step`` (rows are ordered engine/cycle, so this keeps
+    every engine but one cycle in ``step``). Used for SVR, whose training cost grows ~n^2."""
+
+    def __init__(self, estimator=None, step: int = 5):
+        self.estimator = estimator
+        self.step = step
+
+    def fit(self, X, y):
+        idx = np.arange(len(X))[:: self.step]
+        Xs = X.iloc[idx] if hasattr(X, "iloc") else X[idx]
+        ys = y.iloc[idx] if hasattr(y, "iloc") else np.asarray(y)[idx]
+        self.estimator_ = clone(self.estimator).fit(Xs, ys)
+        return self
+
+    def predict(self, X):
+        return self.estimator_.predict(X)
+
+
+def cross_validate_model(model, X, y, folds, seed: int = RANDOM_STATE, target_col: str = "RUL_capped") -> pd.DataFrame:
+    """GroupKFold evaluation. The whole pipeline (normalisation included) is cloned and re-fitted on
+    each training fold. Predictions are made on the full validation trajectories (features are causal),
+    then scored (a) on all rows and (b) on one random cut per engine, which mimics the test set."""
+    rows = []
+    for k, (tr_idx, va_idx) in enumerate(folds):
+        t0 = time.perf_counter()
+        m = clone(model).fit(X.iloc[tr_idx], y.iloc[tr_idx])
+        fit_s = time.perf_counter() - t0
+        va = X.iloc[va_idx]
+        pred = pd.Series(np.clip(m.predict(va), 0, None), index=va.index)
+        all_rows = regression_report(y.iloc[va_idx], pred)
+        cut = random_truncation(va, seed=seed + k)
+        one = regression_report(cut[target_col], pred.loc[cut.index])
+        rows.append({"fold": k, "RMSE all rows": all_rows["RMSE"], "MAE all rows": all_rows["MAE"],
+                     "RMSE random cut": one["RMSE"], "MAE random cut": one["MAE"],
+                     "NASA score / engine (random cut)": one["NASA score"] / one["n"],
+                     "fit time (s)": fit_s})
+    return pd.DataFrame(rows)
